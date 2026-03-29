@@ -1,0 +1,24 @@
+{
+  "name": "mulesoft-mcp-bridge",
+  "version": "1.0.0",
+  "description": "OAuth 2.1 bridge server that wraps the local MuleSoft MCP server and exposes it via ngrok for Claude Desktop",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@mulesoft/mcp-server": "^1.2.0",
+    "@ngrok/ngrok": "^1.7.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "express-session": "^1.19.0",
+    "jose": "^5.10.0",
+    "uuid": "^11.0.0"
+  }
+}
