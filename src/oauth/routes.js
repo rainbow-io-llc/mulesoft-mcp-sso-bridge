@@ -5,11 +5,14 @@ import { verifyS256Challenge } from './pkce.js';
 import { signToken } from './jwt.js';
 import { config } from '../config.js';
 
+// Stores pending PKCE state per client_id while the user is on the Anypoint login page.
+// Key: client_id  Value: { code_challenge, code_challenge_method, claudeRedirectUri, scope, expiresAt }
+const pendingAuthorizes = new Map();
+
 export function oauthRouter() {
   const router = Router();
 
   // ─── Discovery: OAuth Protected Resource Metadata (RFC 9728) ─────────────────
-  // MCP spec requires this endpoint so clients know which auth server to use.
   router.get('/.well-known/oauth-protected-resource', (req, res) => {
     const base = config.publicUrl;
     res.json({
@@ -54,7 +57,7 @@ export function oauthRouter() {
 
     clients.set(clientId, {
       clientId,
-      clientSecret: null,   // public client — PKCE only
+      clientSecret: null,
       redirectUris: redirect_uris,
       grantTypes,
       scope: 'mcp',
@@ -73,12 +76,12 @@ export function oauthRouter() {
   });
 
   // ─── Authorization Endpoint ───────────────────────────────────────────────────
-  // Validates Claude Desktop's OAuth request, then redirects to Anypoint Platform
-  // login page. The user authenticates with their Anypoint credentials there.
+  // Validates Claude Desktop's PKCE request, stores the challenge, then redirects
+  // to Anypoint Platform's login page. Anypoint sends the code back directly to
+  // Claude Desktop via https://claude.ai/api/mcp/auth_callback (registered in Anypoint).
   router.get('/authorize', (req, res) => {
     const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state, scope } = req.query;
 
-    // Validate required params
     if (response_type !== 'code') {
       return res.status(400).json({ error: 'unsupported_response_type' });
     }
@@ -90,10 +93,9 @@ export function oauthRouter() {
     }
 
     // Auto-register Claude Desktop as a public client if it skipped /register
-    let client = clients.get(client_id);
-    if (!client) {
+    if (!clients.has(client_id)) {
       console.log(`[oauth] Auto-registering client: ${client_id}`);
-      client = {
+      clients.set(client_id, {
         clientId: client_id,
         clientSecret: null,
         redirectUris: [redirect_uri],
@@ -101,98 +103,38 @@ export function oauthRouter() {
         scope: 'mcp',
         clientName: 'Claude Desktop',
         createdAt: Date.now(),
-      };
-      clients.set(client_id, client);
-    } else if (!client.redirectUris.includes(redirect_uri)) {
-      client.redirectUris.push(redirect_uri);
+      });
     }
 
-    // Save the full Claude Desktop authorize request in the session so we can
-    // resume it after the user logs in via Anypoint.
-    req.session.pendingAuthorize = { client_id, redirect_uri, code_challenge, code_challenge_method, state, scope };
+    // Save PKCE state keyed by client_id so we can verify it in /token.
+    // Claude Desktop will send the code_verifier there after Anypoint redirects back.
+    pendingAuthorizes.set(client_id, {
+      code_challenge,
+      code_challenge_method,
+      claudeRedirectUri: redirect_uri,   // e.g. https://claude.ai/api/mcp/auth_callback
+      scope: scope ?? 'mcp',
+      expiresAt: Date.now() + config.authCodeTtl * 1000,
+    });
 
-    // Generate a random bridgeState to bind the Anypoint callback to this session.
-    // We pass it as `state` to Anypoint so we can verify it on return.
-    const bridgeState = randomBytes(16).toString('hex');
-    req.session.bridgeState = bridgeState;
+    // Redirect to Anypoint login.
+    // redirect_uri MUST match what is registered in the Anypoint Connected App.
+    // We pass Claude Desktop's own state through so Claude can validate it on return.
+    const anypointUrl = new URL(config.anypoint.authorizeUrl);
+    anypointUrl.searchParams.set('response_type', 'code');
+    anypointUrl.searchParams.set('client_id', config.anypoint.clientId);
+    anypointUrl.searchParams.set('redirect_uri', redirect_uri);  // https://claude.ai/api/mcp/auth_callback
+    anypointUrl.searchParams.set('scope', config.anypoint.oauthScope);
+    if (state) anypointUrl.searchParams.set('state', state);
 
-    // Build the Anypoint OAuth authorization URL
-    const anypointAuthUrl = new URL(config.anypoint.authorizeUrl);
-    anypointAuthUrl.searchParams.set('response_type', 'code');
-    anypointAuthUrl.searchParams.set('client_id', config.anypoint.clientId);
-    anypointAuthUrl.searchParams.set('redirect_uri', `${config.publicUrl}/callback`);
-    anypointAuthUrl.searchParams.set('scope', config.anypoint.oauthScope);
-    anypointAuthUrl.searchParams.set('state', bridgeState);
-
-    console.log(`[oauth] Redirecting to Anypoint login for client ${client_id}`);
-    res.redirect(anypointAuthUrl.toString());
-  });
-
-  // ─── Anypoint OAuth Callback ──────────────────────────────────────────────────
-  // Anypoint redirects here after the user authenticates. We exchange the
-  // Anypoint code for a token, get the user's identity, then issue our own
-  // authorization code back to Claude Desktop.
-  router.get('/callback', async (req, res) => {
-    const { code: anypointCode, state, error, error_description } = req.query;
-
-    // Handle Anypoint login errors (e.g. user denied)
-    if (error) {
-      console.error(`[oauth] Anypoint login error: ${error} — ${error_description}`);
-      return res.status(400).send(`
-        <html><body style="font-family:sans-serif;padding:40px">
-          <h2>Authentication Failed</h2>
-          <p><strong>${error}</strong>: ${error_description ?? 'The Anypoint login was denied or failed.'}</p>
-          <p>Close this window and try again.</p>
-        </body></html>
-      `);
-    }
-
-    // Validate state to prevent CSRF (bind Anypoint callback to this session)
-    if (!state || state !== req.session.bridgeState) {
-      console.error('[oauth] State mismatch in /callback — possible CSRF');
-      return res.status(400).json({ error: 'invalid_state', error_description: 'OAuth state mismatch' });
-    }
-
-    if (!anypointCode) {
-      return res.status(400).json({ error: 'invalid_request', error_description: 'Missing code from Anypoint' });
-    }
-
-    const pendingAuthorize = req.session.pendingAuthorize;
-    if (!pendingAuthorize) {
-      return res.status(400).json({ error: 'invalid_request', error_description: 'No pending authorization — session may have expired' });
-    }
-
-    // Exchange the Anypoint code for an access token
-    let anypointToken;
-    try {
-      anypointToken = await exchangeAnypointCode(anypointCode);
-    } catch (err) {
-      console.error('[oauth] Anypoint token exchange failed:', err.message);
-      return res.status(502).json({ error: 'upstream_error', error_description: 'Failed to exchange code with Anypoint Platform' });
-    }
-
-    // Get the authenticated user's identity from Anypoint
-    let userId;
-    try {
-      userId = await getAnypointUserId(anypointToken.access_token);
-    } catch (err) {
-      console.error('[oauth] Failed to get Anypoint user info:', err.message);
-      // Fall back to the sub claim in the token if userinfo fails
-      userId = anypointToken.username ?? 'anypoint-user';
-    }
-
-    console.log(`[oauth] Anypoint SSO success for user: ${userId}`);
-
-    // Clear session state
-    req.session.bridgeState = null;
-    req.session.pendingAuthorize = null;
-    req.session.userId = userId;
-
-    // Issue our authorization code back to Claude Desktop
-    issueCode(req, res, pendingAuthorize, userId);
+    console.log(`[oauth] Redirecting to Anypoint login (client: ${client_id})`);
+    res.redirect(anypointUrl.toString());
   });
 
   // ─── Token Endpoint ───────────────────────────────────────────────────────────
+  // Claude Desktop calls this after Anypoint redirects back to claude.ai with the code.
+  // Two code types are handled:
+  //   1. Our own bridge code (in the local codes Map) — for future local-auth flows
+  //   2. An Anypoint authorization code — exchange it with Anypoint, then issue our JWT
   router.post('/token', async (req, res) => {
     const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body;
 
@@ -203,40 +145,64 @@ export function oauthRouter() {
       return res.status(400).json({ error: 'invalid_request', error_description: 'Missing required parameters' });
     }
 
-    const record = codes.get(code);
-    if (!record) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code not found or expired' });
-    }
-    if (record.expiresAt < Date.now()) {
-      codes.delete(code);
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code expired' });
-    }
-    if (record.clientId !== client_id) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
-    }
-    if (record.redirectUri !== redirect_uri) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+    // ── Path 1: our own bridge code ──────────────────────────────────────────
+    const localRecord = codes.get(code);
+    if (localRecord) {
+      return handleLocalCode(req, res, localRecord, { code, redirect_uri, client_id, code_verifier });
     }
 
-    // Verify PKCE
-    if (!verifyS256Challenge(code_verifier, record.codeChallenge)) {
-      codes.delete(code);
+    // ── Path 2: Anypoint authorization code ─────────────────────────────────
+    const pending = pendingAuthorizes.get(client_id);
+    if (!pending) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'No pending authorization for this client. Start the flow again.' });
+    }
+    if (pending.expiresAt < Date.now()) {
+      pendingAuthorizes.delete(client_id);
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization session expired. Start the flow again.' });
+    }
+
+    // Verify PKCE — the code_verifier must match the code_challenge from /authorize
+    if (!verifyS256Challenge(code_verifier, pending.code_challenge)) {
+      pendingAuthorizes.delete(client_id);
       return res.status(400).json({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' });
     }
 
-    // Single-use: delete code immediately
-    codes.delete(code);
+    // Verify redirect_uri matches what was used in /authorize
+    if (redirect_uri !== pending.claudeRedirectUri) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+    }
+
+    // Exchange the Anypoint code for an Anypoint access token
+    let anypointToken;
+    try {
+      anypointToken = await exchangeAnypointCode(code, redirect_uri);
+    } catch (err) {
+      console.error('[oauth] Anypoint token exchange failed:', err.message);
+      return res.status(502).json({ error: 'upstream_error', error_description: `Anypoint token exchange failed: ${err.message}` });
+    }
+
+    // Get the authenticated user's identity from Anypoint
+    let userId;
+    try {
+      userId = await getAnypointUserId(anypointToken.access_token);
+    } catch (err) {
+      console.error('[oauth] Anypoint userinfo failed:', err.message);
+      userId = anypointToken.username ?? anypointToken.sub ?? 'anypoint-user';
+    }
+
+    console.log(`[oauth] Anypoint SSO success — user: ${userId}, client: ${client_id}`);
+    pendingAuthorizes.delete(client_id);
 
     // Issue our JWT access token (sub = Anypoint user identity)
     const { token, jti, expiresAt } = await signToken({
-      sub: record.userId,
-      scope: record.scope ?? 'mcp',
+      sub: userId,
+      scope: pending.scope,
     });
 
     tokens.set(jti, {
       clientId: client_id,
-      userId: record.userId,
-      scope: record.scope ?? 'mcp',
+      userId,
+      scope: pending.scope,
       expiresAt,
     });
 
@@ -244,7 +210,7 @@ export function oauthRouter() {
       access_token: token,
       token_type: 'Bearer',
       expires_in: config.accessTokenTtl,
-      scope: record.scope ?? 'mcp',
+      scope: pending.scope,
     });
   });
 
@@ -253,32 +219,49 @@ export function oauthRouter() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function issueCode(req, res, pendingAuthorize, userId) {
-  const { client_id, redirect_uri, code_challenge, code_challenge_method, state, scope } = pendingAuthorize;
+async function handleLocalCode(req, res, record, { code, redirect_uri, client_id, code_verifier }) {
+  if (record.expiresAt < Date.now()) {
+    codes.delete(code);
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code expired' });
+  }
+  if (record.clientId !== client_id) {
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+  }
+  if (record.redirectUri !== redirect_uri) {
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+  }
+  if (!verifyS256Challenge(code_verifier, record.codeChallenge)) {
+    codes.delete(code);
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' });
+  }
 
-  const code = randomBytes(32).toString('base64url');
-  codes.set(code, {
-    clientId: client_id,
-    redirectUri: redirect_uri,
-    codeChallenge: code_challenge,
-    codeChallengeMethod: code_challenge_method,
-    userId,
-    scope: scope ?? 'mcp',
-    expiresAt: Date.now() + config.authCodeTtl * 1000,
+  codes.delete(code); // single-use
+
+  const { token, jti, expiresAt } = await signToken({
+    sub: record.userId,
+    scope: record.scope ?? 'mcp',
   });
 
-  const callbackUrl = new URL(redirect_uri);
-  callbackUrl.searchParams.set('code', code);
-  if (state) callbackUrl.searchParams.set('state', state);
+  tokens.set(jti, {
+    clientId: client_id,
+    userId: record.userId,
+    scope: record.scope ?? 'mcp',
+    expiresAt,
+  });
 
-  res.redirect(callbackUrl.toString());
+  res.json({
+    access_token: token,
+    token_type: 'Bearer',
+    expires_in: config.accessTokenTtl,
+    scope: record.scope ?? 'mcp',
+  });
 }
 
-async function exchangeAnypointCode(code) {
+async function exchangeAnypointCode(code, redirectUri) {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
-    redirect_uri: `${config.publicUrl}/callback`,
+    redirect_uri: redirectUri,
     client_id: config.anypoint.clientId,
     client_secret: config.anypoint.clientSecret,
   });
@@ -291,7 +274,7 @@ async function exchangeAnypointCode(code) {
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`Anypoint token endpoint returned ${resp.status}: ${text}`);
+    throw new Error(`HTTP ${resp.status}: ${text}`);
   }
 
   return resp.json();
@@ -303,10 +286,10 @@ async function getAnypointUserId(accessToken) {
   });
 
   if (!resp.ok) {
-    throw new Error(`Anypoint userinfo returned ${resp.status}`);
+    throw new Error(`HTTP ${resp.status}`);
   }
 
   const data = await resp.json();
-  // Anypoint /accounts/api/me returns { username, email, ... }
+  // Anypoint /accounts/api/me returns { username, email, id, ... }
   return data.username ?? data.email ?? data.id ?? 'anypoint-user';
 }

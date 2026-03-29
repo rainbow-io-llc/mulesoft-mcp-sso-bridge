@@ -36,9 +36,9 @@ export const config = {
     clientId:     required('ANYPOINT_CLIENT_ID'),
     clientSecret: required('ANYPOINT_CLIENT_SECRET'),
     region,
-    // OAuth endpoints on the Anypoint Platform identity provider
-    authorizeUrl: `${anypointBase}/accounts/oauth2/authorize`,
-    tokenUrl:     `${anypointBase}/accounts/oauth2/token`,
+    // Anypoint Connected App OAuth v2 endpoints
+    authorizeUrl: `${anypointBase}/accounts/api/v2/oauth2/authorize`,
+    tokenUrl:     `${anypointBase}/accounts/api/v2/oauth2/token`,
     userInfoUrl:  `${anypointBase}/accounts/api/me`,
     // Scopes requested from Anypoint during SSO login
     oauthScope: optional('ANYPOINT_OAUTH_SCOPE', 'openid profile email'),

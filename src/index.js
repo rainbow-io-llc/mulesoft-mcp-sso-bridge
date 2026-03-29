@@ -82,16 +82,7 @@ function printInstructions(publicUrl) {
 
   Public URL   : ${publicUrl}
   MCP endpoint : ${publicUrl}/mcp
-  OAuth login  : ${publicUrl}/authorize  (→ Anypoint login page)
-  Callback URL : ${publicUrl}/callback   ← Register this in Anypoint!
-
-─────────────────────────────────────────────────────────────────
-  ⚠  One-time Anypoint Connected App setup (each ngrok restart)
-─────────────────────────────────────────────────────────────────
-  1. Go to Anypoint Platform > Access Management > Connected Apps
-  2. Open your app (client ID: ${mcpEntry.mcpServers.mulesoft.args[1].split('/')[2].split('.')[0]}...)
-  3. Ensure grant types include: authorization_code + client_credentials
-  4. Add/update Redirect URI:  ${publicUrl}/callback
+  OAuth login  : ${publicUrl}/authorize  →  Anypoint login page
 
 ─────────────────────────────────────────────────────────────────
   Claude Desktop Connector
@@ -99,16 +90,14 @@ function printInstructions(publicUrl) {
   Settings → Connectors → Add MCP Server:
   URL: ${publicUrl}/mcp
 
-  (Or add to claude_desktop_config.json:)
-${JSON.stringify(mcpEntry, null, 2)}
-
 ─────────────────────────────────────────────────────────────────
   OAuth SSO Flow (first use)
 ─────────────────────────────────────────────────────────────────
   1. Claude Desktop triggers auth → browser opens Anypoint login
   2. Sign in with your Anypoint Platform credentials
-  3. Anypoint redirects back → bridge issues JWT to Claude Desktop
-  4. Claude Desktop is now connected to MuleSoft MCP tools
+  3. Anypoint redirects to claude.ai → Claude calls our /token
+  4. Bridge exchanges Anypoint code, issues JWT to Claude Desktop
+  5. Claude Desktop is now connected to MuleSoft MCP tools
 
   Press Ctrl+C to stop the bridge.
 `);
